@@ -1,5 +1,5 @@
 /* Atlas service worker — offline-first, everything precached. */
-const VERSION = 'atlas-v1.0.0';
+const VERSION = 'atlas-v1.0.1';
 const ASSETS = [
   './', './index.html', './manifest.json', './privacy.html', './support.html', './shared.css',
   './icon-192.png', './icon-512.png', './icon-180.png',
