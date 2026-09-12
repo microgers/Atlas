@@ -405,7 +405,28 @@ function WorldMap(canvas, data) {
     let cx = 0, cy = 0;
     for (let k = 0; k < big.length; k += 2) { cx += big[k]; cy += big[k + 1]; }
     cx /= big.length / 2; cy /= big.length / 2;
-    return { lon: cx, lat: cy, bbox: [x0, y0, x1, y1], span: Math.max(x1 - x0, y1 - y0) };
+
+    /* How far the country really reaches, measured as wrapped offsets from
+       its own centre and counting only the rings that belong to the same
+       landmass. That keeps Russia and Sweden whole while leaving French
+       Guiana, Reunion, Hawaii and Svalbard out of the framing maths. */
+    const NEAR = 25;
+    let w = 0, e = 0, s = 0, n = 0;
+    rings.forEach(r => {
+      let rx = 0, ry = 0;
+      for (let k = 0; k < r.length; k += 2) { rx += r[k]; ry += r[k + 1]; }
+      rx /= r.length / 2; ry /= r.length / 2;
+      const dl0 = ((rx - cx + 540) % 360) - 180;
+      if (Math.hypot(dl0 * Math.cos(cy * Math.PI / 180), ry - cy) > NEAR) return;
+      for (let k = 0; k < r.length; k += 2) {
+        const dl = ((r[k] - cx + 540) % 360) - 180, da = r[k + 1] - cy;
+        if (dl < -w) w = -dl; if (dl > e) e = dl;
+        if (da < -s) s = -da; if (da > n) n = da;
+      }
+    });
+
+    return { lon: cx, lat: cy, bbox: [x0, y0, x1, y1], ext: { w: w, e: e, s: s, n: n },
+             span: Math.max(x1 - x0, y1 - y0) };
   }
 
   const META = {}, CTXMETA = {}, LANDC = {}, LANDM = {}, CTXC = {}, CTXM = {};
@@ -431,7 +452,7 @@ function WorldMap(canvas, data) {
     showContext: true, onPick: null, theme: {}, focus: null
   };
 
-  let W = 0, H = 0, DPR = 1, paths = {}, anim = 0, flying = false;
+  let W = 0, H = 0, DPR = 1, paths = {}, pbox = {}, anim = 0, flying = false;
   let fast = false, queued = 0, stars = null, starsKey = '';
   let pulseUntil = 0, pulseId = 0;
 
@@ -452,6 +473,32 @@ function WorldMap(canvas, data) {
                   oy: H / 2 - ((b[1] + b[3]) / 2) * k + S.pan.y };
   }
 
+  /* Turn a tap back into lon/lat. Only the globe needs this: it is the one
+     projection where far-side vertices get flattened onto the rim, which can
+     leave a shape's outline sweeping across ground it does not occupy. */
+  function unproject(px, py) {
+    if (S.proj !== 'globe') return null;
+    const f = frame(), k = f.k;
+    const x = (px - f.ox) / k, y = -(py - f.oy) / k;
+    const rho = Math.hypot(x, y);
+    if (rho > 1 || rho === 0) return rho > 1 ? null : { lon: S.rot.lon, lat: S.rot.lat };
+    const c = Math.asin(rho), sc = Math.sin(c), cc = Math.cos(c);
+    const p0 = S.rot.lat * D2R, sp0 = Math.sin(p0), cp0 = Math.cos(p0);
+    const lat = Math.asin(cc * sp0 + (y * sc * cp0) / rho) / D2R;
+    let lon = S.rot.lon + Math.atan2(x * sc, rho * cc * cp0 - y * sc * sp0) / D2R;
+    lon = ((lon + 540) % 360) - 180;
+    return { lon: lon, lat: lat };
+  }
+
+  /* Does this tap actually fall within the country's own extent? */
+  function inBox(c, ll) {
+    if (!ll) return true;
+    const bb = META[c].bbox, pad = 1.5;
+    if (ll.lat < bb[1] - pad || ll.lat > bb[3] + pad) return false;
+    if (bb[2] - bb[0] > 180) return true;          /* wraps the date line */
+    return ll.lon >= bb[0] - pad && ll.lon <= bb[2] + pad;
+  }
+
   /* Cheap back-face test: is any part of this shape on the lit side? */
   function onNearSide(m) {
     if (!PROJECTIONS[S.proj].rotates) return true;
@@ -465,14 +512,16 @@ function WorldMap(canvas, data) {
   function buildPaths() {
     const f = frame(), { P, k, ox, oy } = f;
     const rotates = !!P.rotates;
-    paths = {};
+    paths = {}; pbox = {};
 
+    /* `bx` is the on-screen box of the biggest ring — the main landmass, not
+       the outlying islands. Labels need the real pixels, not an estimate. */
     const make = (rings) => {
       const p = new Path2D();
-      let any = false;
+      let any = false, bx = null, ba = -1, boxes = [];
+      let fx0 = 1e9, fy0 = 1e9, fx1 = -1e9, fy1 = -1e9;
       for (const r of rings) {
-        /* skip rings entirely behind the globe — this is what used to
-           collapse onto the rim and streak while you dragged */
+        let rx0 = 1e9, ry0 = 1e9, rx1 = -1e9, ry1 = -1e9;
         if (rotates) {
           let visible = false;
           for (let i = 0; i < r.length; i += 2) {
@@ -483,33 +532,46 @@ function WorldMap(canvas, data) {
         let started = false, drew = 0, prevLon = null;
         for (let i = 0; i < r.length; i += 2) {
           const lon = r[i];
-          /* the date line only tears a FLAT map; on a globe it is seamless */
           const cut = !rotates && prevLon !== null && Math.abs(lon - prevLon) > 180;
           prevLon = lon;
           const q = P.fwd(lon, r[i + 1], S.rot);
           const x = q[0] * k + ox, y = q[1] * k + oy;
+          if (x < rx0) rx0 = x; if (x > rx1) rx1 = x;
+          if (y < ry0) ry0 = y; if (y > ry1) ry1 = y;
           if (!started || cut) {
             if (started && drew > 2) p.closePath();
             p.moveTo(x, y); started = true; drew = 1;
           } else { p.lineTo(x, y); drew++; }
         }
-        if (drew > 2) { p.closePath(); any = true; }
+        if (drew > 2) {
+          p.closePath(); any = true;
+          const a = (rx1 - rx0) * (ry1 - ry0);
+          const rb = { x0: rx0, y0: ry0, x1: rx1, y1: ry1 };
+          boxes.push(rb);
+          if (a > ba) { ba = a; bx = rb; }
+          if (rx0 < fx0) fx0 = rx0; if (rx1 > fx1) fx1 = rx1;
+          if (ry0 < fy0) fy0 = ry0; if (ry1 > fy1) fy1 = ry1;
+        }
       }
-      return any ? p : null;
+      if (bx) {
+        bx = { x0: bx.x0, y0: bx.y0, x1: bx.x1, y1: bx.y1, rings: boxes,
+               all: { x0: fx0, y0: fy0, x1: fx1, y1: fy1 } };
+      }
+      return any ? { p: p, bx: bx } : null;
     };
 
     for (const c in SH) {
       if (S.only && !S.only.has(c)) continue;
       if (!onNearSide(META[c])) continue;
       const p = make(SH[c]);
-      if (p) paths[c] = p;
+      if (p) { paths[c] = p.p; pbox[c] = p.bx; }
     }
     paths.__ctx = {};
     if (S.showContext && !S.only) {
       for (const n in CTXSH) {
         if (!onNearSide(CTXMETA[n])) continue;
         const p = make(CTXSH[n]);
-        if (p) paths.__ctx[n] = p;
+        if (p) paths.__ctx[n] = p.p;
       }
     }
     return f;
@@ -768,9 +830,20 @@ function WorldMap(canvas, data) {
       }
     }
 
-    /* ---------- labels ---------- */
+    /* ---------- labels ----------
+       A pill sitting on a country hides the very shape you are trying to
+       learn, and a bounding box is no guide: Moldova, Chile and Vietnam are
+       all wider than their name and still vanish underneath it. So the pill
+       only stays put when it lands wholly on land with room to spare —
+       otherwise it moves off the shape and a leader line points back. */
     if (S.labels.length) {
       ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      const placed = [];
+      const hits = (a) => placed.some(b =>
+        a.x0 < b.x1 + 4 && a.x1 > b.x0 - 4 && a.y0 < b.y1 + 4 && a.y1 > b.y0 - 4);
+      const overlaps = (a, b, pad) =>
+        a.x0 < b.x1 + pad && a.x1 > b.x0 - pad && a.y0 < b.y1 + pad && a.y1 > b.y0 - pad;
+
       for (const L of S.labels) {
         const m = META[L.code]; if (!m) continue;
         if (S.only && !S.only.has(L.code)) continue;
@@ -779,14 +852,135 @@ function WorldMap(canvas, data) {
         const x = q[0] * k + ox, y = q[1] * k + oy;
         const fs = L.size || 13;
         ctx.font = (L.bold ? '600 ' : '500 ') + fs + 'px ' + (T.font || 'system-ui');
-        const w = ctx.measureText(L.text).width;
-        const pad = 5, h = fs + 7;
+        const tw = ctx.measureText(L.text).width;
+        const pad = 5, h = fs + 7, w = tw + pad * 2;
+
+        /* the shape exactly as drawn: its main landmass, in screen pixels */
+        const bx = pbox[L.code];
+        const aw = bx ? bx.x1 - bx.x0 : 0, ah = bx ? bx.y1 - bx.y0 : 0;
+        const apparent = Math.max(aw, ah);
+        const path = paths[L.code];
+
+        /* Can the pill sit on the country? Only if the outline is clearly
+           bigger than it and every corner of the pill is on land, so a thin
+           country never disappears under its own name. */
+        /* device pixels: isPointInPath does not apply the DPR transform */
+        const onLand = (px2, py2) => ctx.isPointInPath(path, px2 * DPR, py2 * DPR);
+        /* Does a pill at this box sit on any part of the country? Every ring
+           counts, so an outlying island is not quietly buried either. */
+        const onShape = (b2) => {
+          if (!bx || !overlaps(b2, bx.all, 4)) return false;
+          for (const r of bx.rings) if (overlaps(b2, r, 4)) return true;
+          return false;
+        };
+
+        let inside = false;
+        if (path && bx && aw > w * 1.6 + 16 && ah > h * 2.4 + 12) {
+          inside = true;
+          const hw = w / 2 + 6, hh = h / 2 + 5;
+          for (let i = 0; i <= 4 && inside; i++) {
+            for (let j = 0; j <= 2; j++) {
+              if (!onLand(x - hw + (hw * 2) * (i / 4), y - hh + (hh * 2) * (j / 2))) {
+                inside = false; break;
+              }
+            }
+          }
+        }
+
+        let lx = x, ly = y, lead = false;
+        if (!inside) {
+          /* keep off the shape itself, and off the sight ring when spotlit */
+          const halo = bx ? { x0: bx.x0, y0: bx.y0, x1: bx.x1, y1: bx.y1 }
+                          : { x0: x - 4, y0: y - 4, x1: x + 4, y1: y + 4 };
+          /* the sight ring, on the same terms the spotlight draws it */
+          const app0 = m.span * k / (globe ? 114.6 : 360);
+          if (S.focus === L.code && !S.only && app0 < 150) {
+            const R = Math.max(28, app0 * 0.78 + 16);
+            halo.x0 = Math.min(halo.x0, x - R); halo.x1 = Math.max(halo.x1, x + R);
+            halo.y0 = Math.min(halo.y0, y - R); halo.y1 = Math.max(halo.y1, y + R);
+          }
+          const rx2 = (halo.x1 - halo.x0) / 2, ry2 = (halo.y1 - halo.y0) / 2;
+          const cx0 = (halo.x0 + halo.x1) / 2, cy0 = (halo.y0 + halo.y1) / 2;
+          /* ring search: nearest free slot, stepping further out if crowded */
+          const dirs = [[0,-1],[1,-0.75],[-1,-0.75],[1,-0.2],[-1,-0.2],[0,1],
+                        [1,0.75],[-1,0.75],[0.6,-1],[-0.6,-1],[0.6,1],[-0.6,1]];
+          let best = null;
+          for (const mul of [1, 1.25, 1.6, 2.1, 2.8]) {
+            for (const d of dirs) {
+              const cx2 = cx0 + d[0] * (rx2 + w / 2 + 14) * mul;
+              const cy2 = cy0 + d[1] * (ry2 + h / 2 + 12) * mul;
+              const box = { x0: cx2 - w/2, x1: cx2 + w/2, y0: cy2 - h/2, y1: cy2 + h/2 };
+              if (box.x0 < 2 || box.y0 < 2 || box.x1 > W - 2 || box.y1 > H - 2) continue;
+              if (hits(box) || overlaps(box, halo, 6)) continue;
+              /* islands and exclaves live outside the main box, so the pill
+                 gets tested against the shape itself, not just its box */
+              if (onShape(box)) continue;
+              best = { cx: cx2, cy: cy2, box: box }; break;
+            }
+            if (best) break;
+          }
+          /* Chile-shaped countries can fill the screen top to bottom and leave
+             no slot on the ring; sweep the whole canvas for the closest gap. */
+          if (!best) {
+            let bd = 1e9;
+            const step = Math.max(12, Math.min(w, h) / 2);
+            for (let cy2 = h/2 + 2; cy2 <= H - h/2 - 2; cy2 += step) {
+              for (let cx2 = w/2 + 2; cx2 <= W - w/2 - 2; cx2 += step) {
+                const box = { x0: cx2 - w/2, x1: cx2 + w/2, y0: cy2 - h/2, y1: cy2 + h/2 };
+                const dist = Math.hypot(cx2 - x, cy2 - y);
+                if (dist >= bd) continue;
+                if (hits(box) || overlaps(box, halo, 2) || onShape(box)) continue;
+                bd = dist; best = { cx: cx2, cy: cy2, box: box };
+              }
+            }
+          }
+          if (!best) {
+            const cx2 = Math.max(w/2 + 2, Math.min(W - w/2 - 2, x));
+            const cy2 = Math.max(h/2 + 2, Math.min(H - h/2 - 2, halo.y0 - h/2 - 12));
+            best = { cx: cx2, cy: cy2, box: { x0: cx2-w/2, x1: cx2+w/2, y0: cy2-h/2, y1: cy2+h/2 } };
+          }
+          lx = best.cx; ly = best.cy; lead = true;
+          placed.push(best.box);
+        } else {
+          placed.push({ x0: x-w/2, x1: x+w/2, y0: y-h/2, y1: y+h/2 });
+        }
+
+        if (lead) {
+          /* start at the pill edge, stop where the line first touches land,
+             so it reads as a pointer and never lies across the country */
+          const dx = x - lx, dy = y - ly, len = Math.hypot(dx, dy) || 1;
+          const ux2 = dx / len, uy2 = dy / len;
+          const tx = Math.abs(ux2) > 1e-6 ? (w / 2 + 1) / Math.abs(ux2) : 1e9;
+          const ty = Math.abs(uy2) > 1e-6 ? (h / 2 + 1) / Math.abs(uy2) : 1e9;
+          const start = Math.min(tx, ty);
+          let ex2 = len;
+          if (path) {
+            for (let t = start; t <= len; t += 2) {
+              if (ctx.isPointInPath(path, (lx + ux2 * t) * DPR, (ly + uy2 * t) * DPR)) { ex2 = t; break; }
+            }
+          }
+          ex2 = Math.max(start, ex2 - 1);
+          if (ex2 > start + 1) {
+            ctx.beginPath();
+            ctx.moveTo(lx + ux2 * start, ly + uy2 * start);
+            ctx.lineTo(lx + ux2 * ex2, ly + uy2 * ex2);
+            ctx.lineWidth = 2.6; ctx.strokeStyle = 'rgba(6,12,22,0.55)'; ctx.stroke();
+            ctx.lineWidth = 1.2; ctx.strokeStyle = L.color || 'rgba(255,255,255,0.85)'; ctx.stroke();
+          }
+          /* a speck gets a ring too, so the line has something to land on */
+          if (apparent < 14) {
+            ctx.beginPath(); ctx.arc(x, y, Math.max(3.5, apparent / 2 + 2.5), 0, 7);
+            ctx.lineWidth = 2.4; ctx.strokeStyle = 'rgba(6,12,22,0.55)'; ctx.stroke();
+            ctx.lineWidth = 1.2; ctx.strokeStyle = L.color || 'rgba(255,255,255,0.85)'; ctx.stroke();
+          }
+        }
+
         ctx.fillStyle = 'rgba(6,12,22,0.78)';
-        roundRect(ctx, x - w / 2 - pad, y - h / 2, w + pad * 2, h, h / 2);
+        roundRect(ctx, lx - w / 2, ly - h / 2, w, h, h / 2);
         ctx.fill();
         ctx.strokeStyle = 'rgba(255,255,255,0.16)'; ctx.lineWidth = 0.7; ctx.stroke();
         ctx.fillStyle = L.color || '#fff';
-        ctx.fillText(L.text, x, y + 0.5);
+        ctx.fillText(L.text, lx, ly + 0.5);
       }
     }
   }
@@ -817,33 +1011,56 @@ function WorldMap(canvas, data) {
     queued = requestAnimationFrame(() => { queued = 0; draw(); });
   }
 
-  function hit(px, py) {
-    let best = null, bestD = 1e9;
-    for (const c in paths) {
-      if (c === '__ctx') continue;
-      if (S.dim && !S.dim.has(c)) continue;
-      if (ctx.isPointInPath(paths[c], px, py)) return c;
-    }
-    const f = frame(), { P, k, ox, oy } = f;
-    for (const c in paths) {
-      if (c === '__ctx') continue;
-      if (S.dim && !S.dim.has(c)) continue;
-      const m = META[c], q = P.fwd(m.lon, m.lat, S.rot);
-      if (!q[2]) continue;
-      const d = Math.hypot(q[0] * k + ox - px, q[1] * k + oy - py);
-      if (d < 22 && d < bestD) { bestD = d; best = c; }
-    }
-    return best;
+  /* Resolve a tap.
+     Order matters: a tap inside a real outline wins, except when it lands
+     almost exactly on a shape too small to have a tappable outline — that is
+     how San Marino beats Italy without Liechtenstein stealing central Germany.
+     With `loose` the search then widens past the current module, so tapping a
+     neighbour returns that neighbour instead of nothing at all. */
+  function hit(px, py, loose) {
+    const visible = c => !(S.only && !S.only.has(c));
+    const scoped  = c => visible(c) && !(S.dim && !S.dim.has(c));
+    const ll = unproject(px, py);
+    const f = frame(), P = f.P, k = f.k, ox = f.ox, oy = f.oy;
+    const dotScale = S.proj === 'globe' ? 0.017 : 0.0055;
+    const tiny = c => META[c].span * k * dotScale <= 9;
+
+    const byPath = test => {
+      for (const c in paths) {
+        if (c === '__ctx' || !test(c)) continue;
+        /* the canvas is scaled by DPR and isPointInPath does not apply that
+           transform to the point, so the test runs in device pixels */
+        if (ctx.isPointInPath(paths[c], px * DPR, py * DPR) && inBox(c, ll)) return c;
+      }
+      return null;
+    };
+    const nearest = (test, radius) => {
+      let best = null, bestD = 1e9;
+      for (const c in paths) {
+        if (c === '__ctx' || !test(c) || !tiny(c)) continue;
+        const mm = META[c], q = P.fwd(mm.lon, mm.lat, S.rot);
+        if (!q[2]) continue;
+        const d = Math.hypot(q[0] * k + ox - px, q[1] * k + oy - py);
+        if (d < radius && d < bestD) { bestD = d; best = c; }
+      }
+      return best;
+    };
+
+    return nearest(scoped, 4) || byPath(scoped) || nearest(scoped, 20) ||
+      (loose ? (nearest(visible, 4) || byPath(visible) || nearest(visible, 20)) : null);
   }
 
   /* ---- camera moves ---- */
-  function spanOf(codes) {
-    let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
-    codes.forEach(c => { const m = META[c]; if (!m) return;
-      x0 = Math.min(x0, m.bbox[0]); y0 = Math.min(y0, m.bbox[1]);
-      x1 = Math.max(x1, m.bbox[2]); y1 = Math.max(y1, m.bbox[3]); });
-    return [x0, y0, x1, y1];
-  }
+  /* Framing is computed from country CENTRES, not from raw bounding boxes.
+     Natural Earth files France with French Guiana and Reunion, and Norway
+     with Svalbard, so a bbox of "Europe" spans a third of the planet and the
+     old fit zoomed out to the whole world. */
+  const gcDeg = (lon1, lat1, lon2, lat2) => {
+    const a1 = lat1 * D2R, a2 = lat2 * D2R, dl = (lon2 - lon1) * D2R;
+    const v = Math.sin(a1) * Math.sin(a2) + Math.cos(a1) * Math.cos(a2) * Math.cos(dl);
+    return Math.acos(Math.max(-1, Math.min(1, v))) / D2R;
+  };
+
   function centreOf(codes) {
     let X = 0, Y = 0, Z = 0, n = 0;
     codes.forEach(c => { const m = META[c]; if (!m) return;
@@ -852,30 +1069,84 @@ function WorldMap(canvas, data) {
     if (!n) return { lon: 0, lat: 0 };
     return { lon: Math.atan2(Y, X) / D2R, lat: Math.atan2(Z, Math.hypot(X, Y)) / D2R };
   }
-  function zoomFor(codes) {
-    const b = spanOf(codes);
-    const w = Math.max(2, b[2] - b[0]), h = Math.max(2, b[3] - b[1]);
-    if (S.proj === 'globe') {
-      const deg = Math.max(w * Math.cos(centreOf(codes).lat * D2R), h);
-      return Math.max(1, Math.min(9, 118 / Math.max(14, deg)));
-    }
-    return Math.max(1, Math.min(11, (2 / (w / 180)) * 0.42));
+
+  /* Fit measured in the projection's own space, so the same code works for
+     the globe and for all four flat maps. Longitudes are unwrapped around the
+     group's centre first, which keeps Oceania together across the date line,
+     and the camera centres on the MIDDLE of the spread rather than on the
+     average position — otherwise an outlier like Greenland sits off screen. */
+  function frameFor(codes) {
+    const c = centreOf(codes);
+    /* How far a country reaches from its own centre. Capped, because Natural
+       Earth files French Guiana under France and Svalbard under Norway, and
+       one territory should not drag the whole frame across an ocean. */
+    let dlo = 0, dhi = 0, alo = 0, ahi = 0, n = 0;
+    codes.forEach(code => {
+      const m = META[code]; if (!m) return;
+      const dl = ((m.lon - c.lon + 540) % 360) - 180;
+      const da = m.lat - c.lat, x = m.ext;
+      if (!n) { dlo = dl - x.w; dhi = dl + x.e; alo = da - x.s; ahi = da + x.n; }
+      else { dlo = Math.min(dlo, dl - x.w); dhi = Math.max(dhi, dl + x.e);
+             alo = Math.min(alo, da - x.s); ahi = Math.max(ahi, da + x.n); }
+      n++;
+    });
+    if (!n) return { lon: 0, lat: 0, zoom: 1 };
+
+    const lon = ((c.lon + (dlo + dhi) / 2 + 540) % 360) - 180;
+    const lat = Math.max(-80, Math.min(80, c.lat + (alo + ahi) / 2));
+
+    /* the extents are already real, so this margin is just breathing room */
+    const degW = (dhi - dlo) * 1.16 + 5;
+    const degH = (ahi - alo) * 1.16 + 5;
+
+    const P = PROJECTIONS[S.proj], b = P.bounds;
+    const base = Math.min(W / (b[2] - b[0]), H / (b[3] - b[1])) * 0.94;
+    const rot = P.rotates ? { lon: lon, lat: lat } : S.rot;
+    const ux = Math.abs(P.fwd(lon + 2, lat, rot)[0] - P.fwd(lon - 2, lat, rot)[0]) / 4;
+    const uy = Math.abs(P.fwd(lon, Math.min(88, lat + 2), rot)[1] -
+                        P.fwd(lon, Math.max(-88, lat - 2), rot)[1]) / 4;
+    if (!(ux > 0) || !(uy > 0)) return { lon: lon, lat: lat, zoom: 1 };
+
+    const kNeed = Math.min(W / (degW * ux), H / (degH * uy));
+    /* never so tight that the surroundings vanish */
+    return { lon: lon, lat: lat, zoom: Math.max(1, Math.min(6, kNeed / base)) };
   }
 
-  /* Frame one country: tight enough that a small one is obvious, never
-     tighter than a few times the region's own framing, never wider than it. */
+  function zoomFor(codes) { return frameFor(codes).zoom; }
+
+  /* One zoom for a whole run. Fitting every country in the scope at once put
+     Russia on screen to ask about the United Kingdom; fitting the largest
+     single country is as wide as any one question can ever need to be. */
+  function zoomForRun(codes) {
+    let z = 0;
+    for (const c of codes) {
+      if (!META[c]) continue;
+      const f = frameFor([c]).zoom;
+      if (!z || f < z) z = f;
+    }
+    return z || 1;
+  }
+
+  /* how many pixels across this country would draw at a given zoom */
+  function apparentPx(code, zoom) {
+    const m = META[code]; if (!m) return 0;
+    const P = PROJECTIONS[S.proj], b = P.bounds;
+    const k = Math.min(W / (b[2] - b[0]), H / (b[3] - b[1])) * 0.94 * zoom;
+    return m.span * k * (S.proj === 'globe' ? 0.017 : 0.0055);
+  }
+
+  /* Only used when a country is too small to see in the module's own frame:
+     tighten just enough, and never more than three times the module zoom. */
   function zoomForFocus(code, scope) {
-    const m2 = META[code];
-    if (!m2) return S.zoom;
-    const zRegion = zoomFor(scope && scope.length ? scope : [code]);
-    const s = Math.max(0.4, m2.span);
-    const want = S.proj === 'globe' ? 23.6 / s : (2 / (s / 180)) * 0.20;
-    return Math.max(zRegion, Math.min(want, Math.min(11, zRegion * 3.6)));
+    const base = zoomFor(scope && scope.length ? scope : [code]);
+    let z = base;
+    for (let i = 0; i < 24 && apparentPx(code, z) < 22; i++) z *= 1.12;
+    return Math.max(base, Math.min(z, Math.min(11, base * 3)));
   }
 
   function flyTo(codes, opts) {
     opts = opts || {};
-    const c = centreOf(codes);
+    const c = opts.centre || centreOf(codes);
     const z = opts.zoom != null ? opts.zoom : Math.max(1, zoomFor(codes) * (opts.mult || 1));
     const from = { lon: S.rot.lon, lat: S.rot.lat, z: S.zoom, px: S.pan.x, py: S.pan.y };
     let to;
@@ -911,6 +1182,13 @@ function WorldMap(canvas, data) {
       if (u < 1) anim = requestAnimationFrame(step);
     };
     anim = requestAnimationFrame(step);
+  }
+
+  /* Park the camera on the framing that shows this whole group. */
+  function flyToFrame(codes, opts) {
+    const f = frameFor(codes);
+    flyTo(codes, Object.assign({ zoom: f.zoom, centre: { lon: f.lon, lat: f.lat } }, opts || {}));
+    return f;
   }
 
   /* ---- idle drift ----
@@ -958,6 +1236,9 @@ function WorldMap(canvas, data) {
   }
 
   /* ---- gestures ---- */
+  /* Fingers wobble. Below this the gesture is a tap and the map does not
+     move; at or above it the map pans and no tap is reported. */
+  const SLOP = 10;
   let drag = null, idleTimer = 0;
   const settle = () => {
     clearTimeout(idleTimer);
@@ -974,7 +1255,7 @@ function WorldMap(canvas, data) {
     if (!drag) return;
     const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
     drag.moved = Math.max(drag.moved, Math.hypot(dx, dy));
-    if (drag.moved < 3) return;
+    if (drag.moved < SLOP) return;
     cancelAnimationFrame(anim);
     fast = true;
     if (PROJECTIONS[S.proj].rotates) {
@@ -990,26 +1271,119 @@ function WorldMap(canvas, data) {
     if (!drag) return;
     const d = drag; drag = null;
     fast = false; requestDraw();
-    if (d.moved < 4 && S.onPick) {
+    if (d.moved < SLOP && S.onPick) {
       const r = canvas.getBoundingClientRect();
-      const c = hit(e.clientX - r.left, e.clientY - r.top);
+      const c = hit(e.clientX - r.left, e.clientY - r.top, true);
       S.onPick(c, e);
     }
   };
   canvas.addEventListener('pointerup', endDrag);
   canvas.addEventListener('pointercancel', () => { drag = null; fast = false; requestDraw(); });
+  /* ---- zoom, Google Earth style ----
+     The old handler multiplied by a fixed step per wheel event. A trackpad
+     fires dozens of tiny events per flick, so that compounded into a lurch.
+     Now the step is proportional to the actual delta, the point under the
+     cursor stays under the cursor, and the camera eases toward the target
+     instead of snapping to it. */
+  const ZMIN = 1, ZMAX = 12;
+  let zTo = null, zPx = null, zLL = null, zRaf = 0;
+
+  /* what sits under the cursor: lon/lat on the globe, projected units on a flat map */
+  function anchorAt(px, py) {
+    const f = frame();
+    if (S.proj === 'globe') {
+      const ll = unproject(px, py);
+      return ll ? { kind: 'll', lon: ll.lon, lat: ll.lat } : null;
+    }
+    return { kind: 'xy', x: (px - f.ox) / f.k, y: (py - f.oy) / f.k };
+  }
+
+  /* Put the anchor back under the cursor after the zoom changed.
+     On a flat map the pan correction is exact. On the globe there is no clean
+     closed form (back-bearings are not reciprocal on a sphere), so the camera
+     is nudged by the projected error the same way a drag moves it, which
+     converges in two or three passes. */
+  function reanchor() {
+    if (!zPx || !zLL) return;
+    const px = zPx[0], py = zPx[1];
+
+    if (zLL.kind === 'xy') {
+      const f = frame();
+      S.pan.x += px - (zLL.x * f.k + f.ox);
+      S.pan.y += py - (zLL.y * f.k + f.oy);
+      return;
+    }
+
+    for (let i = 0; i < 5; i++) {
+      const f = frame(), P = f.P, k = f.k;
+      const q = P.fwd(zLL.lon, zLL.lat, S.rot);
+      if (!q[2]) return;
+      const ex = (q[0] * k + f.ox) - px;
+      const ey = (q[1] * k + f.oy) - py;
+      if (Math.hypot(ex, ey) < 0.3) return;
+
+      /* how the point moves on screen per degree of camera rotation */
+      const h = 0.35;
+      const qa = P.fwd(zLL.lon, zLL.lat, { lon: S.rot.lon + h, lat: S.rot.lat });
+      const qb = P.fwd(zLL.lon, zLL.lat, { lon: S.rot.lon, lat: S.rot.lat + h });
+      const a11 = (qa[0] - q[0]) * k / h, a21 = (qa[1] - q[1]) * k / h;
+      const a12 = (qb[0] - q[0]) * k / h, a22 = (qb[1] - q[1]) * k / h;
+      const det = a11 * a22 - a12 * a21;
+      if (!isFinite(det) || Math.abs(det) < 1e-9) return;
+
+      S.rot.lon += (-ex * a22 + ey * a12) / det;
+      S.rot.lat = Math.max(-88, Math.min(88, S.rot.lat + (ex * a21 - ey * a11) / det));
+    }
+  }
+
+  function easeZoom() {
+    if (zRaf) return;
+    const step = () => {
+      zRaf = 0;
+      if (zTo == null) return;
+      const diff = zTo - S.zoom;
+      if (Math.abs(diff) < 0.0015) {
+        S.zoom = zTo; zTo = null;
+        reanchor(); fast = false; draw();
+        return;
+      }
+      S.zoom += diff * 0.28;
+      reanchor();
+      fast = true; draw();
+      zRaf = requestAnimationFrame(step);
+    };
+    zRaf = requestAnimationFrame(step);
+  }
+
   canvas.addEventListener('wheel', e => {
     e.preventDefault();
     noteTouch();
-    S.zoom = Math.max(1, Math.min(12, S.zoom * (e.deltaY < 0 ? 1.12 : 0.893)));
-    fast = true; requestDraw(); settle();
+    cancelAnimationFrame(anim);
+    const r = canvas.getBoundingClientRect();
+    const px = e.clientX - r.left, py = e.clientY - r.top;
+
+    let d = e.deltaY;
+    if (e.deltaMode === 1) d *= 16;          /* lines  */
+    else if (e.deltaMode === 2) d *= 100;    /* pages  */
+
+    /* macOS sends pinch as a ctrl-wheel, and it wants a firmer response */
+    const rate = e.ctrlKey ? 0.010 : 0.0022;
+    let f = Math.exp(-d * rate);
+    f = Math.max(0.75, Math.min(1.33, f));   /* one event can never lurch */
+
+    const from = zTo == null ? S.zoom : zTo;
+    zTo = Math.max(ZMIN, Math.min(ZMAX, from * f));
+    zPx = [px, py];
+    zLL = anchorAt(px, py);
+    easeZoom();
   }, { passive: false });
 
   addEventListener('resize', () => { size(); requestDraw(); });
   size();
 
-  return { S, draw, size, flyTo, hit, META, canvas, requestDraw, idleSpin,
-           setFocus, zoomForFocus, zoomOf: zoomFor, noteTouch,
+  return { S, draw, size, flyTo, hit, META, canvas, requestDraw, idleSpin, unproject,
+           setFocus, zoomForFocus, zoomForRun, zoomOf: zoomFor, apparentPx, noteTouch,
+           frameFor, flyToFrame,
            setProj(p) {
       S.proj = p; S.pan.x = 0; S.pan.y = 0;
       if (p !== 'globe') stopSpin(); else if (spinAllowed) startSpin();
@@ -1059,12 +1433,14 @@ function haptic(kind) {
   if (navigator.vibrate) { try { navigator.vibrate(kind === 'wrong' ? [18, 40, 18] : 12); } catch (e) {} }
 }
 
-/* ===================== speech ===================== */
+/* ===================== voice =====================
+   Every country, capital and region was rendered once with a neural
+   voice and shipped with the app, grouped into one audio sprite per
+   module. The device's own text-to-speech is only a fallback for
+   phrases that have no recording. */
 const synth = window.speechSynthesis || null;
 let voice = null, sound = lsGet('atlas-sound') !== '0';
 
-/* Known-natural voices, best first. Anything labelled Natural or Neural wins
-   outright; the "Compact" family is the robotic one and gets pushed down. */
 const NICE = ['Google UK English Female', 'Google UK English Male', 'Google US English',
   'Samantha', 'Serena', 'Daniel', 'Karen', 'Tessa', 'Moira', 'Fiona', 'Alex', 'Allison'];
 
@@ -1083,7 +1459,6 @@ function voiceScore(v) {
   if (/compact|eloquence|novelty|whisper|bells|bubbles|zarvox|trinoids/i.test(n)) s -= 400;
   return s;
 }
-
 function pickVoice() {
   if (!synth) return;
   const v = synth.getVoices();
@@ -1091,22 +1466,133 @@ function pickVoice() {
   voice = v.slice().sort((a, b) => voiceScore(b) - voiceScore(a))[0] || null;
 }
 if (synth) { pickVoice(); synth.onvoiceschanged = pickVoice; }
-function speak(t) {
-  if (!sound || !t) return;
-  if (native('speak', { text: t })) return;
-  if (!synth) return;
+
+/* ---- recorded clips ----
+   The sprites are decoded with the Web Audio API rather than seeked with an
+   <audio> element: seeking needs the host to serve HTTP range requests, and
+   from a cache, a file:// bundle or a plain static host it often cannot. A
+   decoded buffer plays any slice exactly, offline, with no server semantics. */
+const VOICE_DIR = 'audio/';
+let VOICES = null;                    /* group -> { clipId: [start, dur] } */
+const buffers = {}, pendingBuf = {};
+let actx = null, node = null, queue = [];
+
+fetch(VOICE_DIR + 'voices.json')
+  .then(r => r.ok ? r.json() : null)
+  .then(j => { VOICES = j || {}; })
+  .catch(() => { VOICES = {}; });
+
+function audioCtx() {
+  if (!actx) {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return null;
+    try { actx = new AC(); } catch (e) { return null; }
+  }
+  if (actx.state === 'suspended') { try { actx.resume(); } catch (e) {} }
+  return actx;
+}
+
+function groupOf(id) {
+  const k = id.split(':');
+  if (k[0] === 'm' || k[0] === 'r') return k[1];
+  const m = MOD_OF[k[1]];
+  return m ? m.id : null;
+}
+function clipOf(id) {
+  if (!VOICES) return null;
+  const g = groupOf(id);
+  const t = g && VOICES[g] && VOICES[g][id];
+  return t ? { g: g, start: t[0], dur: t[1] } : null;
+}
+
+function loadGroup(g) {
+  if (buffers[g]) return Promise.resolve(buffers[g]);
+  if (pendingBuf[g]) return pendingBuf[g];
+  const ctx = audioCtx();
+  if (!ctx) return Promise.reject(new Error('no audio'));
+  pendingBuf[g] = fetch(VOICE_DIR + g + '.mp3')
+    .then(r => { if (!r.ok) throw new Error('missing'); return r.arrayBuffer(); })
+    .then(ab => new Promise((res, rej) => {
+      const p = ctx.decodeAudioData(ab, res, rej);
+      if (p && p.then) p.then(res, rej);       /* older Safari has no promise */
+    }))
+    .then(buf => {
+      buffers[g] = buf;
+      delete pendingBuf[g];
+      const ks = Object.keys(buffers);         /* keep two modules decoded */
+      while (ks.length > 2) delete buffers[ks.shift()];
+      return buf;
+    })
+    .catch(e => { delete pendingBuf[g]; throw e; });
+  return pendingBuf[g];
+}
+
+function stopNode() {
+  if (node) { try { node.onended = null; node.stop(); } catch (e) {} node = null; }
+}
+function stopVoice() {
+  queue = [];
+  stopNode();
+  if (synth) { try { synth.cancel(); } catch (e) {} }
+}
+function drain() {
+  if (node || !queue.length) return;
+  const next = queue.shift();
+  if (next) playOne(next.id, next.fallback);
+}
+function playOne(id, fallback) {
+  const c = clipOf(id);
+  if (!c) return ttsSpeak(fallback);
+  loadGroup(c.g).then(buf => {
+    const ctx = audioCtx();
+    if (!ctx) return ttsSpeak(fallback);
+    stopNode();
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    src.connect(ctx.destination);
+    src.onended = () => { if (node === src) { node = null; drain(); } };
+    node = src;
+    src.start(0, c.start, c.dur);
+  }).catch(() => ttsSpeak(fallback));
+}
+function ttsSpeak(t) {
+  if (!synth || !t) return;
   try {
     if (!voice) pickVoice();
     synth.cancel();
     const u = new SpeechSynthesisUtterance(t);
     if (voice) { u.voice = voice; u.lang = voice.lang; }
     u.rate = 0.95; u.pitch = 1.0; u.volume = 1;
-    /* Safari drops an utterance queued in the same tick as a cancel */
     setTimeout(() => { try { synth.speak(u); } catch (e) {} }, 30);
   } catch (e) {}
 }
+
+/* say('c:FR') plays the recording; say(null, 'text') falls back to the
+   device voice; an array plays clips back to back. */
+function say(id, fallback) {
+  if (!sound) return;
+  stopVoice();
+  if (Array.isArray(id)) {
+    queue = id.slice(1).map(x => ({ id: x, fallback: '' }));
+    playOne(id[0], fallback);
+  } else if (id) {
+    playOne(id, fallback);
+  } else {
+    ttsSpeak(fallback);
+  }
+}
+function warmVoice(g) { if (VOICES && VOICES[g]) loadGroup(g).catch(() => {}); }
+
+/* iOS will not start audio until a gesture has touched the context */
+addEventListener('pointerdown', function unlock() {
+  removeEventListener('pointerdown', unlock);
+  audioCtx();
+}, { once: true, passive: true });
+
+const speak = t => say(null, t);      /* legacy text path */
+
 const SPK = `<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M7 2.5 3.8 5.2H1.6v5.6h2.2L7 13.5zM10 5.4a3.4 3.4 0 0 1 0 5.2M12.1 3.3a6.3 6.3 0 0 1 0 9.4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/></svg>`;
-const spk = (t, lbl) => `<button class="spk" data-say="${esc(t)}" aria-label="Pronounce ${esc(lbl || t)}">${SPK}</button>`;
+const spk = (id, lbl, fb) => `<button class="spk" data-clip="${esc(id)}" data-say="${esc(fb || lbl || '')}" aria-label="Pronounce ${esc(lbl || '')}">${SPK}</button>`;
 const CHEV = `<svg class="chev" viewBox="0 0 8 13" aria-hidden="true"><path d="M1.5 1.5 6.5 6.5 1.5 11.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
 const BACK = `<svg viewBox="0 0 12 20" aria-hidden="true"><path d="M10 1 2 10l8 9" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
 
@@ -1151,6 +1637,7 @@ const hist = [];
 function nav(html, opts) {
   opts = opts || {};
   if (map) map.idleSpin(false);
+  stopVoice();
   $('#nav-back').hidden = !opts.back;
   $('#nav-back-t').textContent = opts.back || '';
   $('#nav-title').textContent = opts.title || '';
@@ -1208,7 +1695,7 @@ function home() {
         <span class="m"><b>Pronunciation audio</b><span>${sound ? 'On' : 'Off'}</span></span>
         <span class="rt">${sound ? 'On' : 'Off'} ${CHEV}</span></button>
     </div>
-    <p class="foot">Tap a country on the map to jump to its module. Progress is stored on this device.
+    <p class="foot">Tap a country on the map to jump to its module. Capitals are shown, never tested. Progress is stored on this device.
     <br><br><button class="bt sm" data-go="reset" style="color:var(--red)">Reset all progress</button></p>
   `, { title: 'Atlas' });
   setProgress(ALL.filter(master).length / ALL.length);
@@ -1258,7 +1745,8 @@ function openModule(id) {
   map.S.dim = new Set(m.codes);
   map.S.markers = new Set(m.codes);
   m.codes.forEach(c => { if (master(c)) map.S.paint[c] = 'known'; });
-  map.flyTo(m.codes);
+  map.flyToFrame(m.codes);
+  warmVoice(m.id);
   const i = MODS.indexOf(m);
   const lessons = m.ch.map((ch, k) => {
     const done = ch.codes.filter(master).length;
@@ -1272,7 +1760,7 @@ function openModule(id) {
   const started = m.codes.some(seen);
   nav(`
     <div class="pad">
-      <h1 class="large">${esc(m.name)} ${spk(m.name, m.name)}</h1>
+      <h1 class="large">${esc(m.name)} ${spk('m:' + m.id, m.name, m.name)}</h1>
       <p class="say">${esc(m.say)}</p>
       <p class="sub" style="margin-top:8px">Module ${m.num} &middot; ${m.codes.length} countries &middot; ${pctOf(m.codes)}% mastered<br>${esc(m.blurb)}</p>
     </div>
@@ -1285,7 +1773,7 @@ function openModule(id) {
     </div>
     <div class="ghead">Lessons</div>
     <div class="group">${lessons}</div>
-    <p class="foot">Each lesson meets the countries, finds them with help, names them cold, then mixes in earlier ones. Quiz rounds never run out.</p>
+    <p class="foot">Each lesson meets the countries, finds them with help, names them cold, then mixes in earlier ones. Quiz rounds never run out. Capitals are shown for context but never tested &mdash; they are not on the course map quizzes.</p>
   `, { back: 'Modules', title: 'Module ' + m.num });
   setProgress(pctOf(m.codes) / 100);
 }
@@ -1309,6 +1797,21 @@ function optionsFor(c, n, pref) {
 
 /* every question routes through here */
 let ITEM = null;
+
+/* The camera parks on a framing that shows the whole module and STAYS there
+   for every question in it. Only a country too small to see at that framing
+   earns a closer look, and the next normal question returns to the anchor. */
+/* One zoom for the whole run, set on the first question and never changed:
+   from then on the map only turns to the country being asked about. Re-fitting
+   the frame per question made it lurch out to the whole module halfway through
+   a lesson, and you do not need Russia on screen to answer about the UK.
+   A speck stays findable on its own terms — marker, spotlight and sight ring. */
+function holdFrame(item, target) {
+  const scope = (item.scope && item.scope.length) ? item.scope : [target];
+  if (V.zoom == null) V.zoom = map.zoomForRun(scope);
+  map.flyTo([target], { zoom: V.zoom });
+}
+
 function ask(item) {
   ITEM = item;
   V.lock = false;
@@ -1325,15 +1828,21 @@ function ask(item) {
       map.S.labels = (item.scope || []).filter(x => x !== c && seen(x))
         .slice(0, 8).map(x => ({ code: x, text: nm(x), size: 12 }));
     }
-    map.flyTo(item.scope && item.scope.length > 1 ? item.scope : [c], { mult: 0.5 });
+    holdFrame(item, c);
     map.S.onPick = picked => {
-      if (V.lock || !picked) return;
+      if (V.lock) return;
+      /* Every tap gets an answer. Silence reads as a broken app. */
+      if (!picked) return nudge('That is open water \u2014 tap the country itself.');
+      const inScope = !item.scope || item.scope.indexOf(picked) >= 0;
+      if (!inScope && picked !== c) {
+        return nudge('That is ' + esc(nm(picked)) + ', which is not in this module. Try again.');
+      }
       judge(picked === c, c, picked);
     };
-    shell(`<div class="ask">Find ${esc(nm(c))} ${spk(nm(c), nm(c))}</div>
+    shell(`<div class="ask">Find ${esc(nm(c))} ${spk('c:' + c, nm(c), nm(c))}</div>
       <p class="asksub">Tap it on the map${item.help ? '' : ' &mdash; no labels this time'}.</p>
       <div class="fb" id="fb"></div>`);
-    speak(nm(c));
+    say('c:' + c, nm(c));
     return;
   }
 
@@ -1344,10 +1853,10 @@ function ask(item) {
       map.S.dim = null;
       map.S.markers = new Set([c]);
       map.S.paint[c] = 'ask';
-      map.flyTo([c], { mult: 0.8 });
+      map.flyTo([c], { zoom: map.zoomForFocus(c, [c]) });
     } else {
       map.S.paint[c] = 'ask';
-      map.flyTo([c], { zoom: map.zoomForFocus(c, item.scope) });
+      holdFrame(item, c);
       map.setFocus(c);
     }
     const opts = optionsFor(c, 4, item.pool);
@@ -1360,10 +1869,10 @@ function ask(item) {
 
   if (item.k === 'cap') {
     map.S.paint[c] = 'ask';
-    map.flyTo([c], { zoom: map.zoomForFocus(c, item.scope) });
+    holdFrame(item, c);
     map.setFocus(c);
     const opts = optionsFor(c, 4, item.pool);
-    shell(`<div class="ask">Capital of ${esc(nm(c))} ${spk(nm(c), nm(c))}</div>
+    shell(`<div class="ask">Capital of ${esc(nm(c))} ${spk('c:' + c, nm(c), nm(c))}</div>
       <div class="opts">${opts.map(x => `<button class="opt" data-pick="${x}">${esc(C[x].c)}</button>`).join('')}</div>
       <div class="fb" id="fb"></div>`);
     return;
@@ -1371,13 +1880,13 @@ function ask(item) {
 
   if (item.k === 'say') {
     map.S.paint[c] = 'ask';
-    map.flyTo([c], { zoom: map.zoomForFocus(c, item.scope) });
+    holdFrame(item, c);
     map.setFocus(c);
     const opts = optionsFor(c, 4, item.pool);
-    shell(`<div class="ask">Which one is said &ldquo;${esc(sayCountry(c))}&rdquo;? ${spk(nm(c), nm(c))}</div>
+    shell(`<div class="ask">Which one is said &ldquo;${esc(sayCountry(c))}&rdquo;? ${spk('c:' + c, nm(c), nm(c))}</div>
       <div class="opts">${opts.map(x => `<button class="opt" data-pick="${x}">${esc(nm(x))}</button>`).join('')}</div>
       <div class="fb" id="fb"></div>`);
-    speak(nm(c));
+    say('c:' + c, nm(c));
     return;
   }
 }
@@ -1397,6 +1906,17 @@ function shell(body) {
         right: V.s === 'speed' ? '' : `<button class="nb r" data-go="finish">Done</button>` });
     if (V.s !== 'speed') setProgress(tot ? V.right / tot : 0);
   }
+}
+
+/* A miss that should not cost a point: says what happened, keeps the question live. */
+let nudgeTimer = 0;
+function nudge(msg) {
+  const fb = $('#fb');
+  if (!fb) return;
+  haptic('wrong');
+  fb.innerHTML = '<b style="color:var(--label2)">' + msg + '</b>';
+  clearTimeout(nudgeTimer);
+  nudgeTimer = setTimeout(() => { if (fb.isConnected && !V.lock) fb.innerHTML = ''; }, 2600);
 }
 
 function judge(ok, c, picked) {
@@ -1422,10 +1942,10 @@ function judge(ok, c, picked) {
   const fb = $('#fb');
   if (fb) {
     fb.innerHTML = ok
-      ? `<b class="ok">Right.</b> ${esc(nm(c))} &middot; ${esc(C[c].c)} ${spk(C[c].c, C[c].c)}<i>${esc(C[c].h)}</i>`
-      : `<b class="no">Not quite.</b> That was ${esc(nm(c))}${picked && picked !== c ? ` &mdash; you picked ${esc(nm(picked))}` : ''}. ${spk(nm(c), nm(c))}<i>${esc(C[c].h)}</i>`;
+      ? `<b class="ok">Right.</b> ${esc(nm(c))} &middot; ${esc(C[c].c)} ${spk('p:' + c, C[c].c, C[c].c)}<i>${esc(C[c].h)}</i>`
+      : `<b class="no">Not quite.</b> That was ${esc(nm(c))}${picked && picked !== c ? ` &mdash; you picked ${esc(nm(picked))}` : ''}. ${spk('c:' + c, nm(c), nm(c))}<i>${esc(C[c].h)}</i>`;
   }
-  speak(ok ? nm(c) : nm(c) + '. ' + C[c].h.replace(/&/g, ' and '));
+  say('c:' + c, nm(c));
 
   haptic(ok ? 'right' : 'wrong');
   native('progress', { mastered: ALL.filter(master).length, total: ALL.length, due: dueList().length });
@@ -1448,7 +1968,6 @@ function buildSteps(m, k) {
   cs.forEach(c => steps.push({ k: 'meet', c }));
   shuffle(cs).forEach(c => steps.push({ k: 'find', c, help: true, scope: cs }));
   shuffle(cs).forEach(c => steps.push({ k: 'name', c, pool: cs, scope: cs }));
-  shuffle(cs).forEach(c => steps.push({ k: 'cap', c, pool: cs, scope: cs }));
   const earlier = m.ch.slice(0, k).reduce((a, x) => a.concat(x.codes), []).filter(seen);
   const mix = shuffle(cs.concat(shuffle(earlier).slice(0, Math.min(5, earlier.length))));
   mix.forEach(c => steps.push({ k: 'find', c, help: false, scope: m.codes }));
@@ -1481,11 +2000,11 @@ function stepOrient() {
   map.S.dim = new Set(V.m.codes); map.S.markers = new Set(cs);
   map.S.paint = {}; cs.forEach(c => map.S.paint[c] = 'on');
   map.S.labels = cs.map(c => ({ code: c, text: nm(c), size: 13, bold: true }));
-  map.flyTo(cs, { mult: 0.75 });
+  map.flyToFrame(cs);
   const names = cs.map(nm);
   nav(`<div class="tag">Lesson ${V.k + 1} of ${V.m.ch.length}</div>
     <div class="card">
-      <div class="cname">${esc(V.ch.t)} ${spk(V.ch.t, V.ch.t)}</div>
+      <div class="cname">${esc(V.ch.t)} ${spk('r:' + V.mid + ':' + V.k, V.ch.t, V.ch.t)}</div>
       <p class="sub" style="margin-top:10px">${cs.length === 1 ? 'One country' : cs.length + ' countries'} &middot; ${esc(V.m.name)}</p>
       <div class="chips">${cs.map(c => `<span class="chip">${esc(nm(c))}</span>`).join('')}</div>
       <div class="hook">${esc(V.m.blurb)}</div>
@@ -1493,7 +2012,7 @@ function stepOrient() {
     <p class="foot">Look at the highlighted shapes before you move on. You will be asked to find them with no labels in a minute.</p>
     <div class="btns"><button class="bt p" data-go="next">Meet ${cs.length === 1 ? 'it' : 'them'}</button></div>`,
     { back: V.m.name, title: 'Lesson ' + (V.k + 1) });
-  speak(`${V.ch.t}. ${cs.length === 1 ? 'One country' : cs.length + ' countries'}: ${listJoin(names)}.`);
+  say(['r:' + V.mid + ':' + V.k].concat(cs.map(x => 'c:' + x)), V.ch.t);
 }
 
 function stepMeet(c) {
@@ -1501,19 +2020,19 @@ function stepMeet(c) {
   map.S.dim = new Set(V.m.codes); map.S.markers = new Set(V.ch.codes);
   map.S.paint = {}; map.S.paint[c] = 'on';
   map.S.labels = [{ code: c, text: nm(c), size: 14, bold: true }];
-  map.flyTo([c], { zoom: map.zoomForFocus(c, V.ch.codes) });
+  holdFrame({ scope: V.ch.codes }, c);
   map.setFocus(c);
   nav(`<div class="tag">New country</div>
     <div class="card">
-      <div class="cname">${esc(nm(c))} ${spk(nm(c), nm(c))}</div>
+      <div class="cname">${esc(nm(c))} ${spk('c:' + c, nm(c), nm(c))}</div>
       <p class="say">${esc(sayCountry(c))}</p>
-      <div class="kv"><span class="k">Capital</span><span class="v">${esc(C[c].c)} ${spk(C[c].c, C[c].c)}</span></div>
+      <div class="kv"><span class="k">Capital</span><span class="v">${esc(C[c].c)} ${spk('p:' + c, C[c].c, C[c].c)}</span></div>
       <div class="kv"><span class="k">Say</span><span class="v" style="font-weight:400;font-style:italic;color:var(--label2)">${esc(sayCapital(c))}</span></div>
       <div class="hook">${esc(C[c].h)}</div>
     </div>
     <div class="btns"><button class="bt p" data-go="next">Got it</button></div>`,
     { back: V.m.name, title: 'Lesson ' + (V.k + 1) });
-  speak(nm(c) + '. Capital, ' + C[c].c + '.');
+  say(['c:' + c, 'p:' + c], nm(c));
 }
 
 function lessonDone() {
@@ -1545,11 +2064,10 @@ function lessonDone() {
       ${next !== null ? `<button class="bt" data-lesson="${next}">Next lesson</button>` : ''}
       <button class="bt" data-go="module">Back to ${esc(V.m.name)}</button>
     </div>`, { back: V.m.name, title: 'Done' });
-  speak(pct === 100 ? 'Clean run.' : 'Lesson done.');
 }
 
 /* ===================== ENDLESS QUIZ ===================== */
-const KINDS = ['find', 'name', 'cap', 'find', 'name', 'shape', 'say'];
+const KINDS = ['find', 'name', 'find', 'shape', 'name', 'say'];
 
 function startQuiz(codes, title, opts) {
   opts = opts || {};
@@ -1643,7 +2161,6 @@ function speedDone() {
       <button class="bt p" data-go="speed">Run it again</button>
       <button class="bt" data-go="home">Modules</button>
     </div>`, { title: 'Speed round' });
-  speak(right + ' correct.');
 }
 
 /* ===================== module orientation ===================== */
@@ -1658,7 +2175,7 @@ function orientModule(id) {
   map.flyTo(m.codes);
   nav(`<div class="tag">Where it sits</div>
     <div class="card">
-      <div class="cname">${esc(m.name)} ${spk(m.name, m.name)}</div>
+      <div class="cname">${esc(m.name)} ${spk('m:' + m.id, m.name, m.name)}</div>
       <p class="say" style="margin-top:8px">${esc(m.say)}</p>
       <div class="hook">${esc(m.blurb)}</div>
       <div class="chips">${m.ch.map(ch => `<span class="chip">${esc(ch.t)}</span>`).join('')}</div>
@@ -1666,7 +2183,7 @@ function orientModule(id) {
     <p class="foot">${m.codes.length} countries, grouped into ${m.ch.length} lessons. Spin or drag the map to look around.</p>
     <div class="btns"><button class="bt p" data-go="module">Start learning</button></div>`,
     { back: m.name, title: 'Module ' + m.num });
-  speak(m.name + '. ' + m.blurb);
+  say('m:' + m.id, m.name);
 }
 
 /* ===================== misc screens ===================== */
@@ -1684,7 +2201,7 @@ function resetScreen(armed) {
 document.addEventListener('click', e => {
   const b = e.target.closest('button'); if (!b) return;
 
-  if (b.dataset.say != null) { speak(b.dataset.say); return; }
+  if (b.dataset.clip != null) { say(b.dataset.clip, b.dataset.say); return; }
 
   if (b.dataset.pick != null) {
     if (V.lock || !ITEM) return;
