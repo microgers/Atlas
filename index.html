@@ -122,6 +122,14 @@ button{font:inherit;color:inherit;border:0;background:none;cursor:pointer}
   background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.3);transition:transform .22s var(--spring)}
 .sw.on{background:var(--green)}
 .sw.on i{transform:translateX(16px)}
+/* forced colours repaint both track and knob the same system colour and drop
+   the shadow, which left a white disc on a white track — no visible control */
+.sw,.sw i{border:1px solid transparent}
+@media (forced-colors:active){
+  .sw{border-color:CanvasText}
+  .sw i{background:CanvasText}
+  .sw.on{background:Highlight}
+}
 .ring{width:28px;height:28px;flex:0 0 auto}
 .ring circle{fill:none;stroke-width:3.4}
 .ring .bg{stroke:var(--fill)}
@@ -188,11 +196,17 @@ button{font:inherit;color:inherit;border:0;background:none;cursor:pointer}
 .big span{font-size:.32em;color:var(--label2);letter-spacing:0;margin-left:4px}
 
 /* ---------- projection picker ---------- */
-.seg{display:flex;background:var(--fill);border-radius:10px;padding:2px;margin:0 16px;gap:2px}
+.seg{display:flex;background:var(--fill);border-radius:10px;padding:2px;margin:0 16px;gap:2px;
+  overflow-x:auto;scrollbar-width:none}
+.seg::-webkit-scrollbar{display:none}
 .seg button{flex:1;padding:7px 4px;border-radius:8px;font-size:13px;font-weight:600;
   color:var(--label);white-space:nowrap}
 .seg button[aria-pressed="true"]{background:var(--bg2);box-shadow:0 1px 3px rgba(0,0,0,.12);
   color:var(--blue);outline:1.5px solid var(--blue);outline-offset:-1.5px}
+/* the selected button sets `outline`, which would otherwise out-specify the
+   global focus ring and leave the one button keyboard users land on first with
+   no focus indicator at all */
+.seg button[aria-pressed="true"]:focus-visible{outline:3px solid var(--blue);outline-offset:2px}
 .pnote{padding:10px 16px 0;font-size:13px;color:var(--label2);line-height:1.45}
 
 .weak{display:flex;flex-wrap:wrap;gap:6px;padding:0 16px}
@@ -1597,7 +1611,7 @@ function say(id, fallback) {
     ttsSpeak(fallback);
   }
 }
-function warmVoice(g) { if (VOICES && VOICES[g]) loadGroup(g).catch(() => {}); }
+function warmVoice(g) { if (sound && VOICES && VOICES[g]) loadGroup(g).catch(() => {}); }
 
 /* iOS will not start audio until a gesture has touched the context */
 addEventListener('pointerdown', function unlock() {
@@ -1659,7 +1673,12 @@ function nav(html, opts) {
   $('#nav-title').textContent = opts.title || '';
   $('#nav-right').innerHTML = opts.right || '';
   $('#view').innerHTML = html;
+  /* Below 900px the side panel is not its own scroll box — the document
+     scrolls — so resetting .scroll alone left each new screen sitting at the
+     previous screen's offset. On a phone that opened Projection halfway down
+     the card list, with the picker off screen above. Reset both. */
   $('.scroll').scrollTop = 0;
+  (document.scrollingElement || document.documentElement).scrollTop = 0;
 }
 function setProgress(p) { $('#prog i').style.width = (p * 100) + '%'; }
 
@@ -2242,10 +2261,14 @@ document.addEventListener('click', e => {
   }
 
   if (b.dataset.proj) {
-    map.setProj(b.dataset.proj);
+    const pick = b.dataset.proj;
+    map.setProj(pick);
     stageBg();
-    lsSet('atlas-proj', b.dataset.proj);
+    lsSet('atlas-proj', pick);
     if (V.draw) V.draw();
+    /* the redraw replaces the button that was just activated */
+    const again = $(`.seg button[data-proj="${pick}"]`);
+    if (again) again.focus();
     return;
   }
 
@@ -2255,11 +2278,20 @@ document.addEventListener('click', e => {
   switch (g) {
     case 'home': return home();
     case 'proj': return projScreen();
-    case 'sound':
+    case 'sound': {
+      /* Flip the row where it stands. Re-rendering the home screen for a
+         boolean threw the list back to the top, dropped keyboard focus off the
+         control being changed, and flew the globe back to its default — all of
+         which read like the navigation this switch exists to stop implying. */
       sound = !sound;
       lsSet('atlas-sound', sound ? '1' : '0');
       if (!sound && synth) synth.cancel();
-      return home();
+      b.setAttribute('aria-checked', sound ? 'true' : 'false');
+      const knob = b.querySelector('.sw'), cap = b.querySelector('.m span');
+      if (knob) knob.classList.toggle('on', sound);
+      if (cap) cap.textContent = sound ? 'On' : 'Off';
+      return;
+    }
     case 'reset': return resetScreen(false);
     case 'reset-arm': return resetScreen(true);
     case 'reset-do':
