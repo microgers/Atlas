@@ -1835,17 +1835,12 @@ function ask(item) {
   map.setFocus(null);
 
   if (item.k === 'find') {
-    if (item.help) {
-      /* Never derive the label set from the target. Naming every candidate
-         except the answer made the one unlabelled country the answer — the
-         same giveaway as centring it, arrived at by omission. These name
-         already-learned countries AROUND the candidates instead, which
-         orients without enumerating. */
-      const inScope = new Set(item.scope || []);
-      const near = (MOD_OF[c] && MOD_OF[c].codes) || [];
-      map.S.labels = near.filter(x => !inScope.has(x) && seen(x))
-        .slice(0, 8).map(x => ({ code: x, text: nm(x), size: 12 }));
-    }
+    /* No labels on a find question, ever. Every country you name is a country
+       that is not the answer, so any label set brackets the target: naming the
+       candidates but one left it as the only bare shape, and naming the
+       neighbours instead just narrowed it to the handful still bare. There is
+       no honest set. The help this round gives is the module standing bright
+       against a dimmed world, and a wrong tap telling you what you hit. */
     holdFrame(item, c);
     map.S.onPick = picked => {
       if (V.lock) return;
@@ -1858,7 +1853,7 @@ function ask(item) {
       judge(picked === c, c, picked);
     };
     shell(`<div class="ask">Find ${esc(nm(c))} ${spk('c:' + c, nm(c), nm(c))}</div>
-      <p class="asksub">Tap it on the map${item.help ? '' : ' &mdash; no labels this time'}.</p>
+      <p class="asksub">Tap it on the map.</p>
       <div class="fb" id="fb"></div>`);
     say('c:' + c, nm(c));
     return;
@@ -1985,11 +1980,11 @@ function buildSteps(m, k) {
   const ch = m.ch[k], cs = ch.codes;
   const steps = [{ k: 'orient' }];
   cs.forEach(c => steps.push({ k: 'meet', c }));
-  shuffle(cs).forEach(c => steps.push({ k: 'find', c, help: true, scope: cs }));
+  shuffle(cs).forEach(c => steps.push({ k: 'find', c, scope: cs }));
   shuffle(cs).forEach(c => steps.push({ k: 'name', c, pool: cs, scope: cs }));
   const earlier = m.ch.slice(0, k).reduce((a, x) => a.concat(x.codes), []).filter(seen);
   const mix = shuffle(cs.concat(shuffle(earlier).slice(0, Math.min(5, earlier.length))));
-  mix.forEach(c => steps.push({ k: 'find', c, help: false, scope: m.codes }));
+  mix.forEach(c => steps.push({ k: 'find', c, scope: m.codes }));
   steps.push({ k: 'done' });
   return steps;
 }
@@ -2134,7 +2129,7 @@ function nextQuestion() {
   else if (V.s === 'speed') k = Math.random() < 0.55 ? 'name' : 'find';
   else { k = KINDS[V.kindI % KINDS.length]; V.kindI++; }
   if (k === 'shape' && V.codes.length < 4) k = 'name';
-  ask({ k, c, pool: V.codes, scope: V.codes, help: false });
+  ask({ k, c, pool: V.codes, scope: V.codes });
 }
 
 function quizDone() {
