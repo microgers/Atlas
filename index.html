@@ -2349,7 +2349,20 @@ function boot() {
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
 else boot();
 
-if('serviceWorker' in navigator)addEventListener('load',function(){navigator.serviceWorker.register('sw.js').catch(function(){});});
+if('serviceWorker' in navigator){
+  /* Was an older worker already driving this page? If so, a newer one taking
+     over means what is on screen is stale, and the page refreshes itself once.
+     On a first-ever visit there is no controller, so nothing reloads. */
+  var hadWorker = !!navigator.serviceWorker.controller, reloaded = false;
+  navigator.serviceWorker.addEventListener('message', function(e){
+    if(e.data && e.data.type === 'sw-updated' && hadWorker && !reloaded){
+      reloaded = true; location.reload();
+    }
+  });
+  addEventListener('load', function(){
+    navigator.serviceWorker.register('sw.js').then(function(r){ r.update(); }).catch(function(){});
+  });
+}
 </script>
 </body>
 </html>
