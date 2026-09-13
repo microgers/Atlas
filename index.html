@@ -1114,17 +1114,13 @@ function WorldMap(canvas, data) {
 
   function zoomFor(codes) { return frameFor(codes).zoom; }
 
-  /* One zoom for a whole run. Fitting every country in the scope at once put
-     Russia on screen to ask about the United Kingdom; fitting the largest
-     single country is as wide as any one question can ever need to be. */
-  function zoomForRun(codes) {
-    let z = 0;
-    for (const c of codes) {
-      if (!META[c]) continue;
-      const f = frameFor([c]).zoom;
-      if (!z || f < z) z = f;
-    }
-    return z || 1;
+  /* where a country's centre lands on screen right now, in CSS pixels */
+  function screenPos(code) {
+    const m = META[code]; if (!m) return null;
+    const f = frame(), q = f.P.fwd(m.lon, m.lat, S.rot);
+    if (!q[2]) return { x: 0, y: 0, on: false, far: true };
+    const x = q[0] * f.k + f.ox, y = q[1] * f.k + f.oy;
+    return { x: x, y: y, on: x >= 0 && x <= W && y >= 0 && y <= H, far: false };
   }
 
   /* how many pixels across this country would draw at a given zoom */
@@ -1143,6 +1139,14 @@ function WorldMap(canvas, data) {
     for (let i = 0; i < 24 && apparentPx(code, z) < 22; i++) z *= 1.12;
     return Math.max(base, Math.min(z, Math.min(11, base * 3)));
   }
+
+  /* Killing a flight must clear the flag too, or the idle drift — which gates
+     on !flying — stays dead for the rest of the session. */
+  function stopFlight() { cancelAnimationFrame(anim); flying = false; }
+
+  /* The learner moved the camera themselves, or the frame it was computed for
+     changed. Whoever is holding a framing needs to know it is no longer valid. */
+  function cameraDisturbed() { if (S.onCamera) S.onCamera(); }
 
   function flyTo(codes, opts) {
     opts = opts || {};
@@ -1254,9 +1258,11 @@ function WorldMap(canvas, data) {
   canvas.addEventListener('pointermove', e => {
     if (!drag) return;
     const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+    const was = drag.moved;
     drag.moved = Math.max(drag.moved, Math.hypot(dx, dy));
     if (drag.moved < SLOP) return;
-    cancelAnimationFrame(anim);
+    if (was < SLOP) cameraDisturbed();     /* first move of this gesture */
+    stopFlight();
     fast = true;
     if (PROJECTIONS[S.proj].rotates) {
       const f = frame();
@@ -1358,7 +1364,8 @@ function WorldMap(canvas, data) {
   canvas.addEventListener('wheel', e => {
     e.preventDefault();
     noteTouch();
-    cancelAnimationFrame(anim);
+    stopFlight();
+    cameraDisturbed();
     const r = canvas.getBoundingClientRect();
     const px = e.clientX - r.left, py = e.clientY - r.top;
 
@@ -1378,14 +1385,15 @@ function WorldMap(canvas, data) {
     easeZoom();
   }, { passive: false });
 
-  addEventListener('resize', () => { size(); requestDraw(); });
+  addEventListener('resize', () => { size(); cameraDisturbed(); requestDraw(); });
   size();
 
   return { S, draw, size, flyTo, hit, META, canvas, requestDraw, idleSpin, unproject,
-           setFocus, zoomForFocus, zoomForRun, zoomOf: zoomFor, apparentPx, noteTouch,
+           setFocus, zoomForFocus, zoomOf: zoomFor, apparentPx, noteTouch, screenPos,
            frameFor, flyToFrame,
            setProj(p) {
       S.proj = p; S.pan.x = 0; S.pan.y = 0;
+      cameraDisturbed();                   /* frames are projection-specific */
       if (p !== 'globe') stopSpin(); else if (spinAllowed) startSpin();
       draw();
     } };
@@ -1798,18 +1806,21 @@ function optionsFor(c, n, pref) {
 /* every question routes through here */
 let ITEM = null;
 
-/* The camera parks on a framing that shows the whole module and STAYS there
-   for every question in it. Only a country too small to see at that framing
-   earns a closer look, and the next normal question returns to the anchor. */
-/* One zoom for the whole run, set on the first question and never changed:
-   from then on the map only turns to the country being asked about. Re-fitting
-   the frame per question made it lurch out to the whole module halfway through
-   a lesson, and you do not need Russia on screen to answer about the UK.
-   A speck stays findable on its own terms — marker, spotlight and sight ring. */
+/* One camera per section, angle and zoom alike.
+   The first question in a scope frames that scope's own countries — far
+   enough out that Iceland, Denmark and Finland are all on screen at once —
+   and every later question in the same scope does not move the map at all.
+   Turning to put the answer in the middle of the screen gave the game away:
+   you could find the country without knowing where it was. A speck stays
+   findable on its own terms — marker, spotlight and sight ring. */
 function holdFrame(item, target) {
   const scope = (item.scope && item.scope.length) ? item.scope : [target];
-  if (V.zoom == null) V.zoom = map.zoomForRun(scope);
-  map.flyTo([target], { zoom: V.zoom });
+  const key = scope.join(',');
+  V.cams = V.cams || {};
+  const cam = V.cams[key] || (V.cams[key] = map.frameFor(scope));
+  if (V.camAt === key) return;           /* already framed — do not move at all */
+  map.flyTo([], { centre: { lon: cam.lon, lat: cam.lat }, zoom: cam.zoom });
+  V.camAt = key;
 }
 
 function ask(item) {
@@ -1825,7 +1836,14 @@ function ask(item) {
 
   if (item.k === 'find') {
     if (item.help) {
-      map.S.labels = (item.scope || []).filter(x => x !== c && seen(x))
+      /* Never derive the label set from the target. Naming every candidate
+         except the answer made the one unlabelled country the answer — the
+         same giveaway as centring it, arrived at by omission. These name
+         already-learned countries AROUND the candidates instead, which
+         orients without enumerating. */
+      const inScope = new Set(item.scope || []);
+      const near = (MOD_OF[c] && MOD_OF[c].codes) || [];
+      map.S.labels = near.filter(x => !inScope.has(x) && seen(x))
         .slice(0, 8).map(x => ({ code: x, text: nm(x), size: 12 }));
     }
     holdFrame(item, c);
@@ -1854,6 +1872,7 @@ function ask(item) {
       map.S.markers = new Set([c]);
       map.S.paint[c] = 'ask';
       map.flyTo([c], { zoom: map.zoomForFocus(c, [c]) });
+      V.camAt = null;                    /* the silhouette view moved us */
     } else {
       map.S.paint[c] = 'ask';
       holdFrame(item, c);
@@ -2001,6 +2020,7 @@ function stepOrient() {
   map.S.paint = {}; cs.forEach(c => map.S.paint[c] = 'on');
   map.S.labels = cs.map(c => ({ code: c, text: nm(c), size: 13, bold: true }));
   map.flyToFrame(cs);
+  V.camAt = null;                        /* the establishing shot moved us */
   const names = cs.map(nm);
   nav(`<div class="tag">Lesson ${V.k + 1} of ${V.m.ch.length}</div>
     <div class="card">
@@ -2110,7 +2130,8 @@ function nextQuestion() {
   const c = pickCode();
   V.last = c;
   let k;
-  if (V.s === 'speed') k = Math.random() < 0.55 ? 'name' : 'find';
+  if (V.shapeOnly) k = 'shape';          /* Silhouettes stays silhouettes */
+  else if (V.s === 'speed') k = Math.random() < 0.55 ? 'name' : 'find';
   else { k = KINDS[V.kindI % KINDS.length]; V.kindI++; }
   if (k === 'shape' && V.codes.length < 4) k = 'name';
   ask({ k, c, pool: V.codes, scope: V.codes, help: false });
@@ -2269,7 +2290,8 @@ document.addEventListener('click', e => {
     case 'shape': {
       const sl = seenList();
       V = { s: 'quiz', codes: sl, title: 'Silhouettes', backLabel: 'Atlas',
-            right: 0, wrong: 0, missed: new Set(), lock: false, last: null, kindI: 0 };
+            right: 0, wrong: 0, missed: new Set(), lock: false, last: null, kindI: 0,
+            shapeOnly: true };
       const c = pickCode(); V.last = c;
       return ask({ k: 'shape', c, pool: sl, scope: sl });
     }
@@ -2299,7 +2321,8 @@ window.atlasCommand = function (cmd) {
   if (cmd === 'shape') {
     const sl = seenList(); if (sl.length < 4) return home();
     V = { s: 'quiz', codes: sl, title: 'Silhouettes', backLabel: 'Atlas',
-          right: 0, wrong: 0, missed: new Set(), lock: false, last: null, kindI: 0 };
+          right: 0, wrong: 0, missed: new Set(), lock: false, last: null, kindI: 0,
+            shapeOnly: true };
     const c = pickCode(); V.last = c; return ask({ k: 'shape', c, pool: sl, scope: sl });
   }
   if (cmd && cmd.indexOf('module:') === 0) return openModule(cmd.slice(7));
@@ -2309,6 +2332,11 @@ window.atlasCommand = function (cmd) {
 /* ===================== boot ===================== */
 function boot() {
   map = WorldMap($('#map'), DATA);
+  /* A resize, a projection change or the learner's own drag all invalidate a
+     held section frame: the cached one was computed for a viewport, a
+     projection and a camera that no longer apply. Recomputing is safe — a
+     section frame depends only on its scope, never on the answer. */
+  map.S.onCamera = () => { V.cams = null; V.camAt = null; };
   map.S.theme = themeVars();
   const p = lsGet('atlas-proj');
   if (p && PROJECTIONS[p]) map.S.proj = p;
