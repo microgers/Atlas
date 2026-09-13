@@ -1,5 +1,5 @@
 /* Atlas service worker — offline-first, everything precached. */
-const VERSION = 'atlas-v1.9.0';
+const VERSION = 'atlas-v1.9.1';
 const ASSETS = [
   './', './index.html', './manifest.json', './privacy.html', './support.html', './shared.css',
   './audio/voices.json', './audio/m10.mp3', './audio/m11.mp3', './audio/m12.mp3', './audio/m13.mp3', './audio/m14.mp3', './audio/m4.mp3', './audio/m5.mp3', './audio/m6.mp3', './audio/m7.mp3', './audio/m8.mp3', './audio/m9.mp3', 
