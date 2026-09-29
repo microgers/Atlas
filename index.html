@@ -1531,7 +1531,8 @@ function groupOf(id) {
   const k = id.split(':');
   if (k[0] === 'm' || k[0] === 'r') return k[1];
   const m = MOD_OF[k[1]];
-  return m ? m.id : null;
+  if (!m) return null;
+  return k[0] === 'f' ? m.id + 'f' : m.id;   /* facts live in their own sprite */
 }
 function clipOf(id) {
   if (!VOICES) return null;
@@ -1794,7 +1795,7 @@ function openModule(id) {
   map.S.markers = new Set(m.codes);
   m.codes.forEach(c => { if (master(c)) map.S.paint[c] = 'known'; });
   map.flyToFrame(m.codes);
-  warmVoice(m.id);
+  warmVoice(m.id); warmVoice(m.id + 'f');
   const i = MODS.indexOf(m);
   const lessons = m.ch.map((ch, k) => {
     const done = ch.codes.filter(master).length;
